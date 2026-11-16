@@ -1,7 +1,7 @@
-import shutil, os, json, time, gc, uuid, hashlib, zipfile, threading, requests, torch, soundfile as sf
-from fastapi import FastAPI, HTTPException
-from starlette.background import BackgroundTask
+import os, json, time, gc, uuid, shutil, hashlib, zipfile, threading, requests, torch, soundfile as sf
+from fastapi import FastAPI, HTTPException, File, Form, UploadFile
 from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 from pydantic import BaseModel
 from typing import Optional, List
 
@@ -20,6 +20,7 @@ app = FastAPI()
 JOBS = {}
 GPU_LOCK = threading.Lock()    # одна пачка за раз
 
+
 class Item(BaseModel):
     id: str
     prompt: Optional[str] = None
@@ -29,36 +30,43 @@ class Item(BaseModel):
     ref_text: Optional[str] = None
     language: str = "ru"
 
+
 class Batch(BaseModel):
     jobs: List[Item]
 
+
 def get_voice(src):
-    if not src.startswith("http"): return src
+    if not src.startswith("http"):
+        return src
     p = f"{REF}/{hashlib.md5(src.encode()).hexdigest()}.wav"
     if not os.path.exists(p):
         open(p, "wb").write(requests.get(src, timeout=60).content)
     return p
+
 
 def build_subtitles(words, max_words_line=3, max_lines=3, max_dur=3.5, gap=0.5):
     clean = lambda t: "".join(c for c in t.lower() if c.isalnum() or c in "-'")
     groups, cur = [], []
     for x in words:
         t = clean(x.word.strip())
-        if not t: continue
+        if not t:
+            continue
         if cur and (x.start - cur[-1][2] > gap or x.end - cur[0][1] > max_dur
                     or len(cur) >= max_words_line * max_lines):
             groups.append(cur); cur = []
         cur.append((t, x.start, x.end))
-    if cur: groups.append(cur)
+    if cur:
+        groups.append(cur)
     out = []
     for i, g in enumerate(groups):
-        lines = [" ".join(t for t, _, _ in g[j:j+max_words_line])
+        lines = [" ".join(t for t, _, _ in g[j:j + max_words_line])
                  for j in range(0, len(g), max_words_line)]
         start = 0.0 if i == 0 else g[0][1]
-        end = groups[i+1][0][1] if i+1 < len(groups) else g[-1][2]
+        end = groups[i + 1][0][1] if i + 1 < len(groups) else g[-1][2]
         out.append({"start": round(start, 2), "end": round(end, 2),
                     "duration": round(end - start, 2), "text": "\n".join(lines)})
     return out
+
 
 def gen_text(it):
     n = round(it.seconds * WPS)
@@ -70,8 +78,10 @@ def gen_text(it):
         timeout=300)
     return r.json()["message"]["content"].strip()
 
+
 def run_batch(job_id, items):
     st = JOBS[job_id]; d = f"{ROOT}/{job_id}"; os.makedirs(d, exist_ok=True)
+    # одна задача в запросе: GUID файлов = GUID архива = job_id
     guids = {it.id: (job_id if len(items) == 1 else str(uuid.uuid4())) for it in items}
     with GPU_LOCK:
         try:
@@ -80,7 +90,8 @@ def run_batch(job_id, items):
             for it in items:
                 g = guids[it.id]
                 try:
-                    if not it.text: it.text = gen_text(it)
+                    if not it.text:
+                        it.text = gen_text(it)
                     open(f"{d}/text_{g}.txt", "w", encoding="utf-8").write(it.text)
                     st["items"][it.id] = {"status": "text_ready", "guid": g}
                 except Exception as e:
@@ -96,10 +107,12 @@ def run_batch(job_id, items):
             asr = WhisperModel("large-v3", device="cuda", compute_type="float16")
             for it in items:
                 g = guids[it.id]
-                if st["items"][it.id]["status"] == "error": continue
+                if st["items"][it.id]["status"] == "error":
+                    continue
                 try:
                     kw = {"text": it.text, "ref_audio": get_voice(it.voice_url)}
-                    if it.ref_text: kw["ref_text"] = it.ref_text
+                    if it.ref_text:
+                        kw["ref_text"] = it.ref_text
                     wav = tts.generate(**kw)[0].squeeze()
                     wp = f"{d}/audio_{g}.wav"; sf.write(wp, wav, SR)
                     segs, _ = asr.transcribe(wp, language=it.language, word_timestamps=True)
@@ -114,15 +127,20 @@ def run_batch(job_id, items):
 
             with zipfile.ZipFile(f"{d}/{job_id}.zip", "w") as z:
                 for f in os.listdir(d):
-                    if f != f"{job_id}.zip": z.write(f"{d}/{f}", f)
-            for f in os.listdir(REF):                 # удалить голоса, загруженные в этом запросе
-                if f.startswith(job_id + "_"): os.remove(f"{REF}/{f}")
+                    if f != f"{job_id}.zip":
+                        z.write(f"{d}/{f}", f)
+            for f in os.listdir(REF):          # удалить голоса, загруженные в этом запросе
+                if f.startswith(job_id + "_"):
+                    os.remove(f"{REF}/{f}")
             st["status"] = "done"
         except Exception as e:
             st["status"] = "error"; st["error"] = str(e)
 
+
 @app.get("/health")
-def health(): return {"ok": True}
+def health():
+    return {"ok": True}
+
 
 @app.post("/batch")
 def batch(b: Batch):
@@ -131,20 +149,6 @@ def batch(b: Batch):
     threading.Thread(target=run_batch, args=(job_id, b.jobs), daemon=True).start()
     return {"job_id": job_id}
 
-@app.get("/status/{job_id}")
-def status(job_id: str):
-    if job_id not in JOBS: raise HTTPException(404)
-    return JOBS[job_id]
-
-@app.get("/result/{job_id}")
-def result(job_id: str):
-    d = f"{ROOT}/{job_id}"; p = f"{d}/{job_id}.zip"
-    if not os.path.exists(p): raise HTTPException(404, "ещё не готово")
-    JOBS[job_id]["downloaded"] = True
-    return FileResponse(p, filename=f"{job_id}.zip",
-                        background=BackgroundTask(shutil.rmtree, d, True))
-
-from fastapi import File, Form, UploadFile
 
 @app.post("/generate")
 async def generate(
@@ -167,3 +171,26 @@ async def generate(
     JOBS[job_id] = {"status": "queued", "items": {}}
     threading.Thread(target=run_batch, args=(job_id, [item]), daemon=True).start()
     return {"job_id": job_id}
+
+
+@app.get("/status/{job_id}")
+def status(job_id: str):
+    if job_id not in JOBS:
+        raise HTTPException(404)
+    return JOBS[job_id]
+
+
+@app.get("/result/{job_id}")
+def result(job_id: str):
+    try:
+        uuid.UUID(job_id)                       # защита от посторонних путей
+    except ValueError:
+        raise HTTPException(404)
+    d = f"{ROOT}/{job_id}"; p = f"{d}/{job_id}.zip"
+    if not os.path.exists(p):
+        raise HTTPException(404, "ещё не готово")
+    if job_id in JOBS:
+        JOBS[job_id]["downloaded"] = True
+    # после отдачи архива папка задачи удаляется с инстанса
+    return FileResponse(p, filename=f"{job_id}.zip",
+                        background=BackgroundTask(shutil.rmtree, d, True))
