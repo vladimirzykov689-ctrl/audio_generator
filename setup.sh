@@ -26,3 +26,9 @@ export LD_LIBRARY_PATH=/venv/main/lib/python3.12/site-packages/nvidia/cublas/lib
 nohup /venv/main/bin/uvicorn server:app --host 0.0.0.0 --port 8000 --app-dir /workspace > /workspace/server.log 2>&1 &
 sleep 3
 echo "READY $(date)"
+
+curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+chmod +x /usr/local/bin/cloudflared
+nohup cloudflared tunnel --url http://localhost:8000 > /workspace/tunnel.log 2>&1 &
+sleep 8
+echo "TUNNEL_URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /workspace/tunnel.log | head -1)"
